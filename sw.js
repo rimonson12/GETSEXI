@@ -1,5 +1,5 @@
 // Train Log service worker: serves the app offline, refreshes files in the background.
-const VERSION = 'train-log-v2';
+const VERSION = 'train-log-v3';
 const ASSETS = ['./', './index.html', './manifest.json', './icon-180.png', './icon-512.png'];
 
 self.addEventListener('install', e => {

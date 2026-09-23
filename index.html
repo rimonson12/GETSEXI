@@ -949,18 +949,52 @@ function payload(h){
   return {action: 'workout', workout: {id: h.id, date, name: h.name, program: h.tag || '', start: fmtTime(h.start), end: fmtTime(h.end),
     minutes: Math.round((h.end - h.start) / 60000), workingSets: st.ws, volume: st.vol, prs: st.prs, exercises: h.exercises.length}, sets};
 }
-async function post(body){
-  const res = await fetch(S.settings.url, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)});
-  return res.json();
+// Two routes to the Sheet. The direct route reads Google's reply; if the phone blocks that reply,
+// the backup route sends blind and then confirms through a script-tag lookup, which phones don't block.
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function jsonp(params){
+  return new Promise((resolve, reject) => {
+    const cb = 'tl_' + uid(); const el = document.createElement('script');
+    const done = () => { clearTimeout(timer); delete window[cb]; el.remove(); };
+    const timer = setTimeout(() => { done(); reject(new Error('no reply from the script (timed out)')); }, 15000);
+    window[cb] = d => { done(); resolve(d); };
+    el.onerror = () => { done(); reject(new Error('Google refused the request. Check that Who has access is Anyone')); };
+    const q = new URLSearchParams(Object.assign({}, params, {callback: cb, t: Date.now()}));
+    el.src = S.settings.url + (S.settings.url.includes('?') ? '&' : '?') + q.toString();
+    document.head.appendChild(el);
+  });
 }
-let syncing = false;
+async function post(body){
+  let directErr = null;
+  try{
+    const res = await fetch(S.settings.url, {method: 'POST', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)});
+    const text = await res.text();
+    try{ return JSON.parse(text); }
+    catch(e){ const m = text.match(/<title>([^<]*)<\/title>/i); directErr = new Error('Google sent back a page instead of data' + (m ? ': ' + m[1] : '')); }
+  }catch(e){ directErr = e; }
+  if(!navigator.onLine) throw new Error('This phone is offline');
+  if(body.action === 'ping'){
+    const j = await jsonp({action: 'ping'});
+    return j && j.ok ? Object.assign({}, j, {via: 'backup'}) : j;
+  }
+  // Backup: send without reading the reply, then confirm the workout landed.
+  await fetch(S.settings.url, {method: 'POST', mode: 'no-cors', headers: {'Content-Type': 'text/plain;charset=utf-8'}, body: JSON.stringify(body)});
+  for(const wait of [1500, 3500]){
+    await sleep(wait);
+    const j = await jsonp({action: 'check', id: body.workout.id});
+    if(j && j.found) return {ok: true, via: 'backup'};
+    if(j && j.ok === false) return j;
+  }
+  return {ok: false, error: 'sent, but the Sheet has not confirmed it yet' + (directErr ? ' (' + directErr.message + ')' : '')};
+}
+let syncing = false, lastSyncError = '';
 async function syncPending(announce){
   if(syncing || !S.settings.url) return;
   const pending = S.history.filter(h => !h.synced); if(!pending.length) return;
   syncing = true; let sent = 0, failed = false;
   for(const h of pending){
     try{ const j = await post(payload(h)); if(j && j.ok){ h.synced = true; sent++; save('history'); } else { failed = true; break; } }
-    catch(e){ failed = true; break; }
+    catch(e){ failed = true; lastSyncError = e && e.message; break; }
   }
   syncing = false;
   if(announce){ if(failed) toast('No connection to your Sheet. It will retry automatically.'); else if(sent) toast(sent === 1 ? 'Sent to Google Sheet' : `Sent ${sent} workouts to Google Sheet`); }
@@ -1398,8 +1432,9 @@ async function saveUrl(){
   S.settings.url = url; save('settings');
   if(!url){ status.className = 'status'; status.textContent = 'Disconnected. Workouts save on this phone.'; return; }
   status.className = 'status'; status.textContent = 'Testing…';
-  try{ const j = await post({action: 'ping'}); if(j && j.ok){ status.className = 'status good'; status.textContent = 'Connected to your Sheet.'; syncPending(true); } else throw new Error(j && j.error); }
-  catch(e){ status.className = 'status bad'; status.textContent = 'Couldn\'t reach the Sheet. Check the URL and that the deployment allows access to Anyone.'; }
+  if(/(^|\.)claude(usercontent)?\.(ai|com)$/.test(location.hostname)){ status.className = 'status bad'; status.textContent = 'This preview can\'t connect to Google. Use the app installed from your GitHub Pages link.'; return; }
+  try{ const j = await post({action: 'ping'}); if(j && j.ok){ status.className = 'status good'; status.textContent = 'Connected to your Sheet.'; syncPending(true); } else throw new Error((j && j.error) || 'unexpected reply'); }
+  catch(e){ status.className = 'status bad'; status.textContent = 'Couldn\'t reach the Sheet: ' + (e && e.message ? e.message : e) + '. Send me this message if it keeps happening.'; }
 }
 document.addEventListener('input', ev => {
   const el = ev.target;
